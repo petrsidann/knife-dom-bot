@@ -1,6 +1,6 @@
 [package]
 name = "knife_dom"
-version = "8.5.2"
+version = "8.12.1"
 edition = "2021"
 
 [dependencies]
@@ -21,5 +21,5 @@ anyhow = "1"
 thiserror = "1"
 dashmap = "6"
 parking_lot = "0.12"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
