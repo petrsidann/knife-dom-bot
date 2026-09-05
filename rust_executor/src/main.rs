@@ -1,9 +1,14 @@
-//! KNIFE DOM v8.5.2 — Systems-test ready with enhanced monitoring logs
-//! - All pre-flight fixes applied
-//! - Extra debug logs for partial fills, timeouts, capital drift
+//! KNIFE DOM v8.12.1 — Final production build with all fixes
+//! - Dual‑mode: Base (1.5% risk, 12 trades, 0.35/0.65) and Boost (3% risk, 4 trades/day, 0.30/0.70)
+//! - Boost triggers on: slope >0.01%, extreme imbalance, ≥2 wins in last 90 min
+//! - Daily loss limit correctly $5.00 (10% of $50)
+//! - Per-trade metadata propagated to logs (reason, imbalance, slope, ATR)
+//! - True MFE/MAE tracked every 500ms and reported on exit
+//! - Maker order support (compile flag), fixed fee accounting
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use anyhow::Result;
@@ -16,24 +21,37 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::time;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{error, info, warn, debug};
-use chrono::Datelike;
+use futures_util::StreamExt;
+use tracing::{error, info, warn};
+use chrono::{Datelike, Timelike, Utc};
 
 type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================
 // CONSTANTS
 // ============================================================
+static TAKER_FEE: LazyLock<Decimal> = LazyLock::new(|| Decimal::new(5, 4));
+static MAKER_FEE: LazyLock<Decimal> = LazyLock::new(|| Decimal::new(2, 4));
+
+// Compile‑time flag: false for testnet (market orders), true for mainnet (limit orders)
+const USE_LIMIT_ORDERS: bool = false;
+
+static DEFAULT_TICK_SIZE: LazyLock<Decimal> = LazyLock::new(|| Decimal::new(1, 2));
+static DEFAULT_STEP_SIZE: LazyLock<Decimal> = LazyLock::new(|| Decimal::new(1, 1));
+
 const ZMQ_REP_BIND: &str = "tcp://127.0.0.1:5555";
 const ZMQ_PUB_BIND: &str = "tcp://127.0.0.1:5556";
 const BINANCE_FUTURES_REST: &str = "https://testnet.binancefuture.com";
 const BINANCE_FUTURES_WS_STREAM: &str = "wss://stream.binancefuture.com/stream";
 const BINANCE_FUTURES_WS_USER: &str = "wss://stream.binancefuture.com/ws";
-const TAKER_FEE: Decimal = Decimal::new(5, 4);
+
+const DAILY_LOSS_LIMIT_PCT: Decimal = Decimal::new(10, 2); // 10%
+const CONSECUTIVE_LOSS_LIMIT: u32 = 4;
+const PAUSE_DURATION: Duration = Duration::from_secs(3600); // 60 min
+const BOOST_MAX_TRADES: u32 = 4;
 
 // ============================================================
-// TYPES (unchanged)
+// TYPES
 // ============================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeSignal {
@@ -44,6 +62,11 @@ pub struct TradeSignal {
     pub sl: Decimal,
     pub tp: Decimal,
     pub leverage: u32,
+    pub boost: bool,
+    pub reason: String,
+    pub imbalance: Decimal,
+    pub slope: Decimal,
+    pub atr: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +85,13 @@ pub struct FillReport {
     pub is_exit: bool,
     pub order_id: String,
     pub pnl: Decimal,
+    pub mode: String,
+    pub signal_reason: String,
+    pub imbalance: Decimal,
+    pub slope: Decimal,
+    pub atr: Decimal,
+    pub mfe: Decimal,
+    pub mae: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,24 +103,62 @@ pub struct OrderBookSnapshot {
 }
 
 // ============================================================
-// DOM ANALYZER (with volume fix)
+// SECOND‑BAR AGGREGATION
+// ============================================================
+#[derive(Debug, Clone, Copy)]
+struct SecBar {
+    time: u64,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
+}
+
+impl SecBar {
+    fn new(time: u64, price: Decimal, volume: Decimal) -> Self {
+        Self { time, open: price, high: price, low: price, close: price, volume }
+    }
+    fn update(&mut self, price: Decimal, volume: Decimal) {
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume += volume;
+    }
+}
+
+// ============================================================
+// DOM ANALYZER
 // ============================================================
 pub struct DomAnalyzer {
     symbol: String,
     book: Arc<Mutex<Option<OrderBookSnapshot>>>,
     price_history: Arc<Mutex<VecDeque<(SystemTime, Decimal)>>>,
     volume_history: Arc<Mutex<VecDeque<(SystemTime, Decimal)>>>,
-    last_signal: Arc<Mutex<SystemTime>>,
+    last_entry: Arc<Mutex<SystemTime>>,
+    last_exit: Arc<Mutex<SystemTime>>,
+    last_result: Arc<Mutex<bool>>,
+    minute_candles: Arc<Mutex<VecDeque<(SystemTime, Decimal, Decimal, Decimal)>>>,
+    sec_bars: Arc<Mutex<VecDeque<SecBar>>>,
+    recent_wins: Arc<Mutex<u32>>,
+    last_win_time: Arc<Mutex<SystemTime>>,
 }
 
 impl DomAnalyzer {
     pub fn new(symbol: String) -> Self {
+        let now = SystemTime::now();
         Self {
             symbol,
             book: Arc::new(Mutex::new(None)),
-            price_history: Arc::new(Mutex::new(VecDeque::with_capacity(1000))),
-            volume_history: Arc::new(Mutex::new(VecDeque::with_capacity(1000))),
-            last_signal: Arc::new(Mutex::new(SystemTime::now() - Duration::from_secs(120))),
+            price_history: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            volume_history: Arc::new(Mutex::new(VecDeque::with_capacity(2000))),
+            last_entry: Arc::new(Mutex::new(now - Duration::from_secs(120))),
+            last_exit: Arc::new(Mutex::new(now - Duration::from_secs(120))),
+            last_result: Arc::new(Mutex::new(true)),
+            minute_candles: Arc::new(Mutex::new(VecDeque::with_capacity(200))),
+            sec_bars: Arc::new(Mutex::new(VecDeque::with_capacity(400))),
+            recent_wins: Arc::new(Mutex::new(0)),
+            last_win_time: Arc::new(Mutex::new(now)),
         }
     }
 
@@ -100,93 +168,284 @@ impl DomAnalyzer {
     }
 
     pub fn update_price(&self, price: Decimal, volume: Decimal) {
-        let mut prices = self.price_history.lock();
-        prices.push_back((SystemTime::now(), price));
-        if prices.len() > 1000 { prices.pop_front(); }
-
-        let mut vols = self.volume_history.lock();
-        vols.push_back((SystemTime::now(), volume));
-        if vols.len() > 1000 { vols.pop_front(); }
-    }
-
-    pub fn analyze(&self) -> Option<(String, Decimal, Decimal, Decimal, String)> {
         let now = SystemTime::now();
+        let sec = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         {
-            let last = *self.last_signal.lock();
-            if now.duration_since(last).unwrap_or(Duration::from_secs(0)) < Duration::from_secs(60) {
-                return None;
+            let mut bars = self.sec_bars.lock();
+            if let Some(last) = bars.back_mut() {
+                if last.time == sec {
+                    last.update(price, volume);
+                } else {
+                    bars.push_back(SecBar::new(sec, price, volume));
+                    if bars.len() > 400 { bars.pop_front(); }
+                }
+            } else {
+                bars.push_back(SecBar::new(sec, price, volume));
             }
         }
+
+        {
+            let mut prices = self.price_history.lock();
+            prices.push_back((now, price));
+            if prices.len() > 2000 { prices.pop_front(); }
+        }
+        {
+            let mut vols = self.volume_history.lock();
+            vols.push_back((now, volume));
+            if vols.len() > 2000 { vols.pop_front(); }
+        }
+
+        let current_minute = sec / 60;
+        let mut candles = self.minute_candles.lock();
+        if let Some(last) = candles.back_mut() {
+            let last_minute = last.0.duration_since(UNIX_EPOCH).unwrap().as_secs() / 60;
+            if last_minute == current_minute {
+                if price > last.2 { last.2 = price; }
+                if price < last.3 { last.3 = price; }
+            } else {
+                candles.push_back((now, price, price, price));
+                if candles.len() > 200 { candles.pop_front(); }
+            }
+        } else {
+            candles.push_back((now, price, price, price));
+        }
+    }
+
+    fn atr(&self, period: usize) -> Decimal {
+        let candles = self.minute_candles.lock();
+        if candles.len() < period + 1 { return Decimal::ZERO; }
+        let mut sum = Decimal::ZERO;
+        let mut count = 0;
+        let mut prev_close = candles[0].1;
+        for i in 1..candles.len() {
+            let (_, _, high, low) = candles[i];
+            let tr = (high - low).max((high - prev_close).abs()).max((low - prev_close).abs());
+            sum += tr;
+            count += 1;
+            prev_close = candles[i].1;
+            if count >= period { break; }
+        }
+        if count == 0 { Decimal::ZERO } else { sum / Decimal::from(count) }
+    }
+
+    fn ema_5m_trend(&self) -> Option<(Decimal, Decimal, Decimal)> {
+        let candles = self.minute_candles.lock();
+        if candles.len() < 100 { return None; }
+        let mut five_min_closes = Vec::new();
+        let mut current_bucket = Vec::new();
+        for c in candles.iter() {
+            let minute_bucket = c.0.duration_since(UNIX_EPOCH).unwrap().as_secs() / 300;
+            if current_bucket.is_empty() {
+                current_bucket.push(*c);
+            } else if minute_bucket == current_bucket[0].0.duration_since(UNIX_EPOCH).unwrap().as_secs() / 300 {
+                current_bucket.push(*c);
+            } else {
+                let close = current_bucket.last().unwrap().1;
+                five_min_closes.push(close);
+                current_bucket.clear();
+                current_bucket.push(*c);
+            }
+        }
+        if five_min_closes.len() < 20 { return None; }
+        let k = Decimal::from(2) / Decimal::from(21);
+        let mut ema = five_min_closes[0];
+        let mut prev_ema = ema;
+        for i in 1..five_min_closes.len() {
+            prev_ema = ema;
+            ema = (five_min_closes[i] - ema) * k + ema;
+        }
+        let current_price = candles.last().unwrap().1;
+        Some((current_price, ema, prev_ema))
+    }
+
+    fn ema_slope(&self) -> Option<Decimal> {
+        let (_, current_ema, prev_ema) = self.ema_5m_trend()?;
+        if prev_ema == Decimal::ZERO { return None; }
+        Some((current_ema - prev_ema).abs() / current_ema)
+    }
+
+    fn is_good_session(&self) -> bool {
+        let now = Utc::now();
+        let hour = now.hour();
+        (hour >= 13 && hour < 21) || (hour >= 0 && hour < 8)
+    }
+
+    fn weighted_imbalance(&self, book: &OrderBookSnapshot) -> Decimal {
+        let mut bid_sum = Decimal::ZERO;
+        let mut ask_sum = Decimal::ZERO;
+        for (i, (_, qty)) in book.bids.iter().take(10).enumerate() {
+            let weight = Decimal::from(1) / Decimal::from(i + 1);
+            bid_sum += qty * weight;
+        }
+        for (i, (_, qty)) in book.asks.iter().take(10).enumerate() {
+            let weight = Decimal::from(1) / Decimal::from(i + 1);
+            ask_sum += qty * weight;
+        }
+        if ask_sum == Decimal::ZERO { return Decimal::ONE; }
+        bid_sum / ask_sum
+    }
+
+    fn volume_spike(&self) -> bool {
+        let bars = self.sec_bars.lock();
+        if bars.len() < 32 { return false; }
+        let last_complete = &bars[bars.len() - 2];
+        let mut sum = Decimal::ZERO;
+        let mut count = 0;
+        for bar in bars.iter().rev().skip(2).take(30) {
+            sum += bar.volume;
+            count += 1;
+        }
+        if count == 0 { return false; }
+        let avg = sum / Decimal::from(count);
+        last_complete.volume > avg * Decimal::new(20, 1) // 2.0×
+    }
+
+    fn sweep(&self, current: Decimal) -> (bool, bool) {
+        let bars = self.sec_bars.lock();
+        if bars.len() < 300 { return (false, false); }
+        let mut high = current;
+        let mut low = current;
+        for bar in bars.iter().rev().skip(1).take(300) {
+            if bar.high > high { high = bar.high; }
+            if bar.low < low { low = bar.low; }
+        }
+        let swept_high = current > high;
+        let swept_low = current < low;
+        (swept_high, swept_low)
+    }
+
+    fn win_freshness(&self) -> bool {
+        let wins = *self.recent_wins.lock();
+        let last_win = *self.last_win_time.lock();
+        let now = SystemTime::now();
+        let within_window = now.duration_since(last_win).unwrap_or(Duration::from_secs(0)) < Duration::from_secs(5400);
+        wins >= 2 && within_window
+    }
+
+    fn boost_mode(&self, imbalance: Decimal, slope: Decimal) -> bool {
+        let strong_trend = slope > Decimal::new(1, 4);
+        let extreme_imbalance = imbalance > Decimal::new(35, 1) || imbalance < Decimal::new(25, 2);
+        strong_trend && extreme_imbalance && self.win_freshness()
+    }
+
+    pub fn set_entry_time(&self, t: SystemTime) {
+        *self.last_entry.lock() = t;
+    }
+
+    pub fn set_exit_info(&self, win: bool) {
+        let now = SystemTime::now();
+        *self.last_exit.lock() = now;
+        *self.last_result.lock() = win;
+        let mut wins = self.recent_wins.lock();
+        if win {
+            *wins += 1;
+            *self.last_win_time.lock() = now;
+        } else {
+            *wins = 0;
+        }
+    }
+
+    pub fn reset_daily_state(&self) {
+        let mut wins = self.recent_wins.lock();
+        *wins = 0;
+        *self.last_win_time.lock() = SystemTime::now();
+    }
+
+    pub fn analyze(&self) -> Option<(String, Decimal, Decimal, Decimal, String, bool, Decimal, Decimal, Decimal)> {
+        let now = SystemTime::now();
+
+        let last_exit = *self.last_exit.lock();
+        let last_entry = *self.last_entry.lock();
+        let last_activity = if last_exit > last_entry { last_exit } else { last_entry };
+        if now.duration_since(last_activity).unwrap_or(Duration::from_secs(0)) < Duration::from_secs(60) {
+            return None;
+        }
+
+        if !self.is_good_session() { return None; }
 
         let book = self.book.lock();
         if book.is_none() { return None; }
         let book = book.as_ref().unwrap();
 
         let prices = self.price_history.lock();
-        if prices.len() < 20 { return None; }
+        if prices.len() < 50 { return None; }
 
-        let vols = self.volume_history.lock();
-        if vols.len() < 20 { return None; }
+        let imbalance = self.weighted_imbalance(book);
+        let vol_spike = self.volume_spike();
+        let current = *prices.back().unwrap().1;
+        let (swept_high, swept_low) = self.sweep(current);
 
-        let bid_depth: Decimal = book.bids.iter().take(10).map(|(_, q)| q).sum();
-        let ask_depth: Decimal = book.asks.iter().take(10).map(|(_, q)| q).sum();
-        let imbalance = if ask_depth > Decimal::ZERO { bid_depth / ask_depth } else { Decimal::ONE };
+        let atr = self.atr(14);
+        if atr == Decimal::ZERO { return None; }
 
-        let one_min_ago = now - Duration::from_secs(60);
+        let trend = self.ema_5m_trend();
+        let (current_price, ema, _) = match trend {
+            Some((p, e, _)) => (p, e),
+            None => return None,
+        };
+        let is_uptrend = current_price > ema;
+        let is_downtrend = current_price < ema;
+        let slope = self.ema_slope().unwrap_or(Decimal::ZERO);
+        let min_slope = Decimal::new(5, 5);
+        let trend_valid = slope > min_slope;
+
+        let boost = self.boost_mode(imbalance, slope);
+
+        let (sl_mult, tp_mult, sl_floor_pct, tp_floor_pct) = if boost {
+            (Decimal::new(40, 2), Decimal::new(90, 2), Decimal::new(30, 4), Decimal::new(70, 4))
+        } else {
+            (Decimal::new(50, 2), Decimal::new(80, 2), Decimal::new(35, 4), Decimal::new(65, 4))
+        };
+
+        let stop_distance = (sl_mult / Decimal::from(100) * atr)
+            .max(current * sl_floor_pct)
+            .min(current * Decimal::new(70, 4));
+        let tp_distance = (tp_mult / Decimal::from(100) * atr)
+            .max(current * tp_floor_pct)
+            .min(current * Decimal::new(120, 4));
+
+        let sl_buy = current - stop_distance;
+        let tp_buy = current + tp_distance;
+        let sl_sell = current + stop_distance;
+        let tp_sell = current - tp_distance;
+
+        let (buy_imbalance, sell_imbalance) = if boost {
+            (Decimal::new(35, 1), Decimal::new(25, 2))
+        } else {
+            (Decimal::new(28, 1), Decimal::new(36, 2))
+        };
+
+        if imbalance > buy_imbalance && vol_spike && swept_low && is_uptrend && trend_valid {
+            *self.last_entry.lock() = now;
+            return Some(("Buy".to_string(), current, sl_buy, tp_buy, "DOM+Sweep+Trend".to_string(), boost, imbalance, slope, atr));
+        }
+
+        let five_min_ago = now - Duration::from_secs(300);
         let recent_prices: Vec<&Decimal> = prices
             .iter()
-            .filter(|(t, _)| *t >= one_min_ago)
+            .filter(|(t, _)| *t >= five_min_ago)
             .map(|(_, p)| p)
             .collect();
-
-        if recent_prices.len() < 2 { return None; }
-
-        let current = *recent_prices.last().unwrap();
-        let start = *recent_prices.first().unwrap();
-        let price_change = if start > Decimal::ZERO { (current - start) / start } else { Decimal::ZERO };
-
-        let historical = &recent_prices[..recent_prices.len() - 1];
-        let recent_high = historical.iter().max().unwrap_or(&current);
-        let recent_low = historical.iter().min().unwrap_or(&current);
-
-        let recent_vols: Vec<&Decimal> = vols.iter().rev().take(10).map(|(_, v)| v).collect();
-        let avg_vol = recent_vols.iter().fold(Decimal::ZERO, |a, &b| a + b) / Decimal::from(10);
-        let current_vol = recent_vols.first().unwrap_or(&Decimal::ONE);
-        let vol_spike = current_vol > &(avg_vol * Decimal::new(15, 1));
-
-        let swept_high = current > *recent_high && vol_spike;
-        let swept_low = current < *recent_low && vol_spike;
-
-        let is_sharp_drop = price_change < Decimal::new(-5, 3);
-        let is_stabilizing = recent_prices.len() > 3 &&
-            recent_prices[recent_prices.len() - 3] > recent_prices[recent_prices.len() - 2] &&
-            current > recent_prices[recent_prices.len() - 2];
-
-        let price = *current;
-        let sl_buy = price * Decimal::new(99, 2);
-        let tp_buy = price * Decimal::new(101, 2);
-        let sl_sell = price * Decimal::new(101, 2);
-        let tp_sell = price * Decimal::new(99, 2);
-
-        if imbalance > Decimal::new(12, 1) && vol_spike && swept_low {
-            *self.last_signal.lock() = now;
-            return Some(("Buy".to_string(), price, sl_buy, tp_buy, "DOM imbalance + sweep".to_string()));
+        if recent_prices.len() < 10 { return None; }
+        let is_sharp_drop = current < **recent_prices.first().unwrap() * Decimal::new(995, 3);
+        let is_stabilizing = recent_prices.len() > 5 &&
+            recent_prices[recent_prices.len() - 4] > recent_prices[recent_prices.len() - 3] &&
+            current > *recent_prices[recent_prices.len() - 2];
+        if is_sharp_drop && is_stabilizing && imbalance > buy_imbalance && is_uptrend && trend_valid {
+            *self.last_entry.lock() = now;
+            return Some(("Buy".to_string(), current, sl_buy, tp_buy, "KnifeCatch".to_string(), boost, imbalance, slope, atr));
         }
 
-        if is_sharp_drop && is_stabilizing && imbalance > Decimal::new(11, 1) {
-            *self.last_signal.lock() = now;
-            return Some(("Buy".to_string(), price, sl_buy, tp_buy, "Knife catch".to_string()));
+        if imbalance < sell_imbalance && vol_spike && swept_high && is_downtrend && trend_valid {
+            *self.last_entry.lock() = now;
+            return Some(("Sell".to_string(), current, sl_sell, tp_sell, "DOM+Sweep+Trend".to_string(), boost, imbalance, slope, atr));
         }
 
-        if imbalance < Decimal::new(8, 1) && vol_spike && swept_high {
-            *self.last_signal.lock() = now;
-            return Some(("Sell".to_string(), price, sl_sell, tp_sell, "DOM imbalance + sweep".to_string()));
-        }
-
-        if price_change > Decimal::new(5, 3) && is_stabilizing && imbalance < Decimal::new(9, 1) {
-            *self.last_signal.lock() = now;
-            return Some(("Sell".to_string(), price, sl_sell, tp_sell, "Knife catch (short)".to_string()));
+        let is_sharp_rise = current > **recent_prices.first().unwrap() * Decimal::new(1005, 3);
+        if is_sharp_rise && is_stabilizing && imbalance < sell_imbalance && is_downtrend && trend_valid {
+            *self.last_entry.lock() = now;
+            return Some(("Sell".to_string(), current, sl_sell, tp_sell, "KnifeCatchShort".to_string(), boost, imbalance, slope, atr));
         }
 
         None
@@ -194,8 +453,9 @@ impl DomAnalyzer {
 }
 
 // ============================================================
-// EXCHANGE INFO & BINANCE CLIENT (unchanged)
+// BINANCE CLIENT
 // ============================================================
+#[derive(Debug, Clone, Copy)]
 pub struct ExchangeInfo {
     pub tick_size: Decimal,
     pub step_size: Decimal,
@@ -204,8 +464,8 @@ pub struct ExchangeInfo {
 impl ExchangeInfo {
     pub fn for_symbol(_symbol: &str) -> Self {
         Self {
-            tick_size: Decimal::new(1, 3),
-            step_size: Decimal::new(1, 1),
+            tick_size: *DEFAULT_TICK_SIZE,
+            step_size: *DEFAULT_STEP_SIZE,
         }
     }
 }
@@ -237,80 +497,67 @@ impl BinanceClient {
     }
 
     fn round_price(&self, price: Decimal, symbol: &str) -> Decimal {
-        let info = self.exchange_info.get(symbol).unwrap_or(&ExchangeInfo { tick_size: Decimal::new(1, 3), step_size: Decimal::new(1, 1) });
+        let default_info = ExchangeInfo {
+            tick_size: *DEFAULT_TICK_SIZE,
+            step_size: *DEFAULT_STEP_SIZE,
+        };
+        let info = self.exchange_info.get(symbol).unwrap_or(&default_info);
         let tick = info.tick_size;
         (price / tick).round() * tick
     }
 
     fn round_size(&self, size: Decimal, symbol: &str) -> Decimal {
-        let info = self.exchange_info.get(symbol).unwrap_or(&ExchangeInfo { tick_size: Decimal::new(1, 3), step_size: Decimal::new(1, 1) });
+        let default_info = ExchangeInfo {
+            tick_size: *DEFAULT_TICK_SIZE,
+            step_size: *DEFAULT_STEP_SIZE,
+        };
+        let info = self.exchange_info.get(symbol).unwrap_or(&default_info);
         let step = info.step_size;
         (size / step).floor() * step
     }
 
-    pub async fn place_market_entry(&self, symbol: &str, side: &str, size: Decimal) -> Result<String> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let side_str = if side == "Buy" { "BUY" } else { "SELL" };
-        let size_r = self.round_size(size, symbol);
+    // Entry order: market or limit depending on USE_LIMIT_ORDERS
+    pub async fn place_entry(&self, symbol: &str, side: &str, price: Decimal, size: Decimal) -> Result<String> {
+        if USE_LIMIT_ORDERS {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let side_str = if side == "Buy" { "BUY" } else { "SELL" };
+            let price_r = self.round_price(price, symbol);
+            let size_r = self.round_size(size, symbol);
 
-        let query = format!(
-            "symbol={}&side={}&type=MARKET&quantity={}&timestamp={}&newOrderRespType=RESULT",
-            symbol, side_str, size_r, ts
-        );
-        let sig = self.sign(&query);
-        let url = format!("{}/fapi/v1/order?{}&signature={}", BINANCE_FUTURES_REST, query, sig);
+            let query = format!(
+                "symbol={}&side={}&type=LIMIT&price={}&quantity={}&timestamp={}&timeInForce=GTX",
+                symbol, side_str, price_r, size_r, ts
+            );
+            let sig = self.sign(&query);
+            let url = format!("{}/fapi/v1/order?{}&signature={}", BINANCE_FUTURES_REST, query, sig);
 
-        let resp = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send().await?;
-        let json: serde_json::Value = resp.json().await?;
+            let resp = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send().await?;
+            let json: serde_json::Value = resp.json().await?;
 
-        if let Some(order_id) = json.get("orderId").and_then(|v| v.as_i64()) {
-            return Ok(order_id.to_string());
+            if let Some(order_id) = json.get("orderId").and_then(|v| v.as_i64()) {
+                return Ok(order_id.to_string());
+            }
+            anyhow::bail!("Limit entry failed: {}", json)
+        } else {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            let side_str = if side == "Buy" { "BUY" } else { "SELL" };
+            let size_r = self.round_size(size, symbol);
+
+            let query = format!(
+                "symbol={}&side={}&type=MARKET&quantity={}&timestamp={}&newOrderRespType=RESULT",
+                symbol, side_str, size_r, ts
+            );
+            let sig = self.sign(&query);
+            let url = format!("{}/fapi/v1/order?{}&signature={}", BINANCE_FUTURES_REST, query, sig);
+
+            let resp = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send().await?;
+            let json: serde_json::Value = resp.json().await?;
+
+            if let Some(order_id) = json.get("orderId").and_then(|v| v.as_i64()) {
+                return Ok(order_id.to_string());
+            }
+            anyhow::bail!("Market entry failed: {}", json)
         }
-        anyhow::bail!("Entry failed: {}", json)
-    }
-
-    pub async fn place_stop_market(&self, symbol: &str, side: &str, stop_price: Decimal, size: Decimal) -> Result<String> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let side_str = if side == "Buy" { "BUY" } else { "SELL" };
-        let stop_r = self.round_price(stop_price, symbol);
-        let size_r = self.round_size(size, symbol);
-
-        let query = format!(
-            "symbol={}&side={}&type=STOP_MARKET&stopPrice={}&quantity={}&timestamp={}&reduceOnly=true",
-            symbol, side_str, stop_r, size_r, ts
-        );
-        let sig = self.sign(&query);
-        let url = format!("{}/fapi/v1/order?{}&signature={}", BINANCE_FUTURES_REST, query, sig);
-
-        let resp = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send().await?;
-        let json: serde_json::Value = resp.json().await?;
-
-        if let Some(order_id) = json.get("orderId").and_then(|v| v.as_i64()) {
-            return Ok(order_id.to_string());
-        }
-        anyhow::bail!("Stop failed: {}", json)
-    }
-
-    pub async fn place_limit(&self, symbol: &str, side: &str, price: Decimal, size: Decimal) -> Result<String> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let side_str = if side == "Buy" { "BUY" } else { "SELL" };
-        let price_r = self.round_price(price, symbol);
-        let size_r = self.round_size(size, symbol);
-
-        let query = format!(
-            "symbol={}&side={}&type=LIMIT&price={}&quantity={}&timestamp={}&reduceOnly=true&timeInForce=GTC",
-            symbol, side_str, price_r, size_r, ts
-        );
-        let sig = self.sign(&query);
-        let url = format!("{}/fapi/v1/order?{}&signature={}", BINANCE_FUTURES_REST, query, sig);
-
-        let resp = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send().await?;
-        let json: serde_json::Value = resp.json().await?;
-
-        if let Some(order_id) = json.get("orderId").and_then(|v| v.as_i64()) {
-            return Ok(order_id.to_string());
-        }
-        anyhow::bail!("Limit failed: {}", json)
     }
 
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
@@ -404,6 +651,11 @@ pub enum AssetState {
         order_id: String,
         sl: Decimal,
         tp: Decimal,
+        mode: String,
+        signal_reason: String,
+        imbalance: Decimal,
+        slope: Decimal,
+        atr: Decimal,
     },
     Closing {
         side: String,
@@ -412,24 +664,35 @@ pub enum AssetState {
         order_id: String,
         sl: Decimal,
         tp: Decimal,
+        mode: String,
+        signal_reason: String,
+        imbalance: Decimal,
+        slope: Decimal,
+        atr: Decimal,
     },
 }
 
 // ============================================================
-// ASSET ENGINE (with extra logging for monitoring)
+// ASSET ENGINE
 // ============================================================
 pub struct AssetEngine {
     symbol: String,
     client: Arc<BinanceClient>,
     pub_tx: tokio::sync::mpsc::UnboundedSender<String>,
     state: Arc<Mutex<AssetState>>,
-    active_orders: Arc<Mutex<Option<(String, String)>>>,
     analyzer: Arc<DomAnalyzer>,
     daily_pnl: Arc<Mutex<Decimal>>,
     daily_loss_limit_usd: Arc<Mutex<Decimal>>,
     daily_trades: Arc<Mutex<u32>>,
+    boost_trades_today: Arc<Mutex<u32>>,
     last_reset_day: Arc<Mutex<u32>>,
     capital: Arc<Mutex<Decimal>>,
+    last_price: Arc<Mutex<Decimal>>,
+    consecutive_losses: Arc<Mutex<u32>>,
+    pause_until: Arc<Mutex<SystemTime>>,
+    initial_capital: Decimal,
+    mfe: Arc<Mutex<Decimal>>,
+    mae: Arc<Mutex<Decimal>>,
 }
 
 impl AssetEngine {
@@ -445,13 +708,19 @@ impl AssetEngine {
             client,
             pub_tx,
             state: Arc::new(Mutex::new(AssetState::Idle)),
-            active_orders: Arc::new(Mutex::new(None)),
             analyzer: Arc::new(DomAnalyzer::new(symbol)),
             daily_pnl: Arc::new(Mutex::new(Decimal::ZERO)),
             daily_loss_limit_usd,
             daily_trades: Arc::new(Mutex::new(0)),
+            boost_trades_today: Arc::new(Mutex::new(0)),
             last_reset_day: Arc::new(Mutex::new(chrono::Utc::now().naive_utc().ordinal())),
             capital: Arc::new(Mutex::new(initial_capital)),
+            last_price: Arc::new(Mutex::new(Decimal::ZERO)),
+            consecutive_losses: Arc::new(Mutex::new(0)),
+            pause_until: Arc::new(Mutex::new(SystemTime::now())),
+            initial_capital,
+            mfe: Arc::new(Mutex::new(Decimal::ZERO)),
+            mae: Arc::new(Mutex::new(Decimal::ZERO)),
         }
     }
 
@@ -459,57 +728,144 @@ impl AssetEngine {
         self.analyzer.clone()
     }
 
-    pub async fn cancel_active_bracket(&self) {
-        let orders = {
-            let mut guard = self.active_orders.lock();
-            guard.take()
+    pub fn update_last_price(&self, price: Decimal) {
+        let mut last = self.last_price.lock();
+        *last = price;
+    }
+
+    async fn monitor_sl_tp(&self) {
+        let (side, size, entry_price, sl, tp, order_id, mode, signal_reason, imbalance, slope, atr) = {
+            let state = self.state.lock();
+            match &*state {
+                AssetState::InPosition { side, size, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } => {
+                    (side.clone(), *size, *entry_price, *sl, *tp, order_id.clone(), mode.clone(), signal_reason.clone(), *imbalance, *slope, *atr)
+                }
+                _ => return,
+            }
         };
-        if let Some((stop_id, limit_id)) = orders {
-            let _ = self.client.cancel_order(&self.symbol, &stop_id).await;
-            let _ = self.client.cancel_order(&self.symbol, &limit_id).await;
-            info!("✅ Cancelled bracket orders: {} / {}", stop_id, limit_id);
+
+        let current_price = *self.last_price.lock();
+        if current_price == Decimal::ZERO { return; }
+
+        let fav = if side == "Buy" { current_price - entry_price } else { entry_price - current_price };
+        let adv = if side == "Buy" { entry_price - current_price } else { current_price - entry_price };
+        {
+            let mut mfe = self.mfe.lock();
+            if fav > *mfe { *mfe = fav; }
+            let mut mae = self.mae.lock();
+            if adv > *mae { *mae = adv; }
+        }
+
+        let should_close = if side == "Buy" {
+            current_price <= sl || current_price >= tp
+        } else {
+            current_price >= sl || current_price <= tp
+        };
+
+        if should_close {
+            info!("🎯 SL/TP triggered at price {}", current_price);
+            if let Ok(close_id) = self.client.close_position(&self.symbol, size, &side).await {
+                info!("📉 Close order placed: {}", close_id);
+                {
+                    let mut state = self.state.lock();
+                    if let AssetState::InPosition { side, size, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } = &*state {
+                        *state = AssetState::Closing {
+                            side: side.clone(),
+                            size: *size,
+                            entry_price: *entry_price,
+                            order_id: order_id.clone(),
+                            sl: *sl,
+                            tp: *tp,
+                            mode: mode.clone(),
+                            signal_reason: signal_reason.clone(),
+                            imbalance: *imbalance,
+                            slope: *slope,
+                            atr: *atr,
+                        };
+                    }
+                }
+            } else {
+                error!("Failed to close position on SL/TP trigger");
+            }
         }
     }
 
     pub async fn process_signal(&self, signal: TradeSignal) -> EngineResponse {
         let today = chrono::Utc::now().naive_utc().ordinal();
         {
-            let mut trades = self.daily_trades.lock();
             let mut reset_day = self.last_reset_day.lock();
             if *reset_day != today {
-                *trades = 0;
                 *reset_day = today;
+                let mut trades = self.daily_trades.lock();
+                *trades = 0;
+                let mut boost_trades = self.boost_trades_today.lock();
+                *boost_trades = 0;
+                self.analyzer.reset_daily_state();
+                let mut pnl = self.daily_pnl.lock();
+                *pnl = Decimal::ZERO;
+                let mut mfe = self.mfe.lock();
+                *mfe = Decimal::ZERO;
+                let mut mae = self.mae.lock();
+                *mae = Decimal::ZERO;
             }
-            if *trades >= 10 {
+        }
+
+        let boost = signal.boost;
+        let max_trades = if boost { 20 } else { 12 };
+        {
+            let trades = self.daily_trades.lock();
+            if *trades >= max_trades {
                 return EngineResponse {
                     status: "REJECTED".to_string(),
-                    message: "Max 10 trades per day reached".to_string(),
+                    message: format!("Max {} trades per day reached", max_trades),
+                    order_id: None,
+                };
+            }
+        }
+
+        if boost {
+            let boost_trades = self.boost_trades_today.lock();
+            if *boost_trades >= BOOST_MAX_TRADES {
+                return EngineResponse {
+                    status: "REJECTED".to_string(),
+                    message: format!("Max boost trades per day ({}) reached", BOOST_MAX_TRADES),
                     order_id: None,
                 };
             }
         }
 
         {
-            let daily = *self.daily_pnl.lock();
-            let limit = *self.daily_loss_limit_usd.lock();
-            if daily < Decimal::ZERO && daily.abs() > limit {
+            let pause_until = *self.pause_until.lock();
+            if SystemTime::now() < pause_until {
                 return EngineResponse {
                     status: "REJECTED".to_string(),
-                    message: format!("Daily loss limit ${:.2} reached", limit),
+                    message: "Paused after consecutive losses".to_string(),
+                    order_id: None,
+                };
+            }
+        }
+
+        let daily_loss_limit = *self.daily_loss_limit_usd.lock();
+        {
+            let daily = *self.daily_pnl.lock();
+            if daily < Decimal::ZERO && daily.abs() > daily_loss_limit {
+                return EngineResponse {
+                    status: "REJECTED".to_string(),
+                    message: format!("Daily loss limit ${:.2} reached", daily_loss_limit),
                     order_id: None,
                 };
             }
         }
 
         if signal.action == "Close" {
-            let (size, side, entry_price, order_id, sl, tp) = {
+            let (size, side, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr) = {
                 let state = self.state.lock();
                 match &*state {
-                    AssetState::InPosition { size, side, entry_price, order_id, sl, tp } => {
-                        (*size, side.clone(), *entry_price, order_id.clone(), *sl, *tp)
+                    AssetState::InPosition { size, side, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } => {
+                        (*size, side.clone(), *entry_price, order_id.clone(), *sl, *tp, mode.clone(), signal_reason.clone(), *imbalance, *slope, *atr)
                     }
-                    AssetState::Closing { size, side, entry_price, order_id, sl, tp } => {
-                        (*size, side.clone(), *entry_price, order_id.clone(), *sl, *tp)
+                    AssetState::Closing { size, side, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } => {
+                        (*size, side.clone(), *entry_price, order_id.clone(), *sl, *tp, mode.clone(), signal_reason.clone(), *imbalance, *slope, *atr)
                     }
                     _ => return EngineResponse {
                         status: "REJECTED".to_string(),
@@ -528,10 +884,13 @@ impl AssetEngine {
                     order_id: order_id.clone(),
                     sl,
                     tp,
+                    mode: mode.clone(),
+                    signal_reason: signal_reason.clone(),
+                    imbalance,
+                    slope,
+                    atr,
                 };
             }
-
-            self.cancel_active_bracket().await;
 
             match self.client.close_position(&self.symbol, size, &side).await {
                 Ok(close_order_id) => {
@@ -552,6 +911,11 @@ impl AssetEngine {
                             order_id,
                             sl,
                             tp,
+                            mode,
+                            signal_reason,
+                            imbalance,
+                            slope,
+                            atr,
                         };
                     }
                     EngineResponse {
@@ -581,8 +945,13 @@ impl AssetEngine {
                 };
             }
 
+            let (risk_frac, cap_frac) = if boost {
+                (Decimal::new(3, 2),  Decimal::new(8, 1))
+            } else {
+                (Decimal::new(15, 3), Decimal::new(5, 1))
+            };
             let live_cap = *self.capital.lock();
-            let risk_amount = live_cap * Decimal::new(2, 2);
+            let risk_amount = live_cap * risk_frac;
             let sl_distance = if signal.action == "Buy" { signal.price - signal.sl } else { signal.sl - signal.price };
             if sl_distance <= Decimal::ZERO {
                 return EngineResponse {
@@ -591,8 +960,11 @@ impl AssetEngine {
                     order_id: None,
                 };
             }
-            let raw_size = risk_amount / sl_distance;
-            let size = self.client.round_size(raw_size, &self.symbol);
+
+            let raw_notional = risk_amount / sl_distance * signal.price;
+            let max_notional = live_cap * Decimal::from(signal.leverage) * cap_frac;
+            let capped_notional = if raw_notional > max_notional { max_notional } else { raw_notional };
+            let size = self.client.round_size(capped_notional / signal.price, &self.symbol);
             if size <= Decimal::ZERO {
                 return EngineResponse {
                     status: "REJECTED".to_string(),
@@ -602,25 +974,28 @@ impl AssetEngine {
             }
 
             let entry_side = signal.action.clone();
-            match self.client.place_market_entry(&self.symbol, &entry_side, size).await {
+            match self.client.place_entry(&self.symbol, &entry_side, signal.price, size).await {
                 Ok(entry_id) => {
-                    {
-                        let mut state = self.state.lock();
-                        *state = AssetState::PendingEntry {
-                            signal: signal.clone(),
-                            order_id: entry_id.clone(),
-                            size,
-                            side: entry_side.clone(),
-                            entry_time: SystemTime::now(),
-                        };
-                    }
+                    let now = SystemTime::now();
+                    self.analyzer.set_entry_time(now);
 
                     {
                         let mut trades = self.daily_trades.lock();
                         *trades += 1;
+                        if boost {
+                            let mut boost_trades = self.boost_trades_today.lock();
+                            *boost_trades += 1;
+                        }
                     }
 
-                    info!("📈 Pending entry: {} @ {} (size: {})", self.symbol, signal.price, size);
+                    {
+                        let mut mfe = self.mfe.lock();
+                        *mfe = Decimal::ZERO;
+                        let mut mae = self.mae.lock();
+                        *mae = Decimal::ZERO;
+                    }
+
+                    info!("📈 Pending entry: {} @ {} (size: {}) | Boost: {}", self.symbol, signal.price, size, boost);
 
                     let state_clone = self.state.clone();
                     let client_clone = self.client.clone();
@@ -661,102 +1036,87 @@ impl AssetEngine {
         }
     }
 
-    // Called when User Data Stream sends FILLED event for entry
     pub fn on_entry_fill(&self, order_id: &str, avg_price: Decimal, filled_size: Decimal) {
-        let mut state = self.state.lock();
-        if let AssetState::PendingEntry { signal, side, size, .. } = &*state {
-            if filled_size > Decimal::ZERO && filled_size <= *size {
-                let actual_size = filled_size;
-                let new_state = AssetState::InPosition {
+        let (signal, side, requested_size) = {
+            let state = self.state.lock();
+            if let AssetState::PendingEntry { signal, side, size, .. } = &*state {
+                (signal.clone(), side.clone(), *size)
+            } else {
+                warn!("Entry fill received while not pending: state {:?}", *state);
+                return;
+            }
+        };
+
+        if filled_size > Decimal::ZERO && filled_size <= requested_size {
+            let actual_size = filled_size;
+            let mode = if signal.boost { "boost".to_string() } else { "base".to_string() };
+            {
+                let mut state = self.state.lock();
+                *state = AssetState::InPosition {
                     side: side.clone(),
                     size: actual_size,
                     entry_price: avg_price,
                     order_id: order_id.to_string(),
                     sl: signal.sl,
                     tp: signal.tp,
+                    mode: mode.clone(),
+                    signal_reason: signal.reason.clone(),
+                    imbalance: signal.imbalance,
+                    slope: signal.slope,
+                    atr: signal.atr,
                 };
-                *state = new_state;
-                info!("✅ Entry confirmed: {} @ {} (size: {})", self.symbol, avg_price, actual_size);
-
-                // If partial fill, log the difference
-                if actual_size < *size {
-                    warn!("⚠️ PARTIAL FILL: requested {}, got {}", size, actual_size);
-                }
-
-                let client = self.client.clone();
-                let symbol = self.symbol.clone();
-                let sl_side = if side == "Buy" { "SELL" } else { "BUY" };
-                let sl_price = signal.sl;
-                let tp_price = signal.tp;
-                let active_orders = self.active_orders.clone();
-                let state_clone = self.state.clone();
-                let pub_tx = self.pub_tx.clone();
-                let symbol_clone = self.symbol.clone();
-                let side_clone = side.clone();
-                let entry_price_clone = avg_price;
-                let size_clone = actual_size;
-                let order_id_clone = order_id.to_string();
-
-                tokio::spawn(async move {
-                    let stop_res = client.place_stop_market(&symbol, sl_side, sl_price, size_clone).await;
-                    let limit_res = client.place_limit(&symbol, sl_side, tp_price, size_clone).await;
-
-                    match (stop_res, limit_res) {
-                        (Ok(sid), Ok(lid)) => {
-                            *active_orders.lock() = Some((sid, lid));
-                            info!("🛡️ Protective orders placed: SL={}, TP={}", sid, lid);
-                        }
-                        (Ok(sid), Err(e)) => {
-                            error!("TP order failed after SL placed: {}. Cleaning up.", e);
-                            let _ = client.cancel_order(&symbol, &sid).await;
-                            let _ = client.close_position(&symbol, size_clone, &side_clone).await;
-                            *state_clone.lock() = AssetState::Idle;
-                            warn!("🚨 Emergency close after TP failure");
-                        }
-                        (Err(e), Ok(lid)) => {
-                            error!("SL order failed after TP placed: {}. Cleaning up.", e);
-                            let _ = client.cancel_order(&symbol, &lid).await;
-                            let _ = client.close_position(&symbol, size_clone, &side_clone).await;
-                            *state_clone.lock() = AssetState::Idle;
-                            warn!("🚨 Emergency close after SL failure");
-                        }
-                        (Err(e1), Err(e2)) => {
-                            error!("Both SL and TP failed: {} | {}. Emergency closing.", e1, e2);
-                            let _ = client.close_position(&symbol, size_clone, &side_clone).await;
-                            *state_clone.lock() = AssetState::Idle;
-                            warn!("🚨 Emergency close after both SL/TP failures");
-                        }
-                    }
-                });
-
-                let report = FillReport {
-                    symbol: symbol_clone,
-                    side: side_clone,
-                    filled_size: size_clone,
-                    avg_price: entry_price_clone,
-                    is_exit: false,
-                    order_id: order_id_clone,
-                    pnl: Decimal::ZERO,
-                };
-                let json = serde_json::to_string(&report).unwrap();
-                let _ = pub_tx.send(json);
-            } else {
-                warn!("Entry fill size mismatch or zero: expected ~{}, got {}", size, filled_size);
             }
+            info!("✅ Entry confirmed: {} @ {} (size: {}) | Mode: {}", self.symbol, avg_price, actual_size, mode);
+
+            if actual_size < requested_size {
+                warn!("⚠️ PARTIAL FILL: requested {}, got {}", requested_size, actual_size);
+            }
+
+            let report = FillReport {
+                symbol: self.symbol.clone(),
+                side: side.clone(),
+                filled_size: actual_size,
+                avg_price,
+                is_exit: false,
+                order_id: order_id.to_string(),
+                pnl: Decimal::ZERO,
+                mode: mode.clone(),
+                signal_reason: signal.reason.clone(),
+                imbalance: signal.imbalance,
+                slope: signal.slope,
+                atr: signal.atr,
+                mfe: Decimal::ZERO,
+                mae: Decimal::ZERO,
+            };
+            let json = serde_json::to_string(&report).unwrap();
+            let _ = self.pub_tx.send(json);
+
+            let self_clone = Arc::new(self.clone());
+            tokio::spawn(async move {
+                let mut interval = time::interval(Duration::from_millis(500));
+                loop {
+                    interval.tick().await;
+                    let in_position = {
+                        let state = self_clone.state.lock();
+                        matches!(*state, AssetState::InPosition { .. })
+                    };
+                    if !in_position { break; }
+                    self_clone.monitor_sl_tp().await;
+                }
+            });
         } else {
-            warn!("Entry fill received while not pending: state {:?}", *state);
+            warn!("Entry fill size mismatch: expected ~{}, got {}", requested_size, filled_size);
         }
     }
 
-    // Called on exit fill (SL/TP or manual close)
     pub fn on_exit_fill(&self, order_id: &str, avg_price: Decimal, filled_size: Decimal) {
         let mut state = self.state.lock();
-        let (side, size, entry_price) = match &*state {
-            AssetState::InPosition { side, size, entry_price, .. } => {
-                (side.clone(), *size, *entry_price)
+        let (side, size, entry_price, sl, tp, mode, signal_reason, imbalance, slope, atr) = match &*state {
+            AssetState::InPosition { side, size, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } => {
+                (side.clone(), *size, *entry_price, *sl, *tp, mode.clone(), signal_reason.clone(), *imbalance, *slope, *atr)
             }
-            AssetState::Closing { side, size, entry_price, .. } => {
-                (side.clone(), *size, *entry_price)
+            AssetState::Closing { side, size, entry_price, order_id, sl, tp, mode, signal_reason, imbalance, slope, atr } => {
+                (side.clone(), *size, *entry_price, *sl, *tp, mode.clone(), signal_reason.clone(), *imbalance, *slope, *atr)
             }
             _ => {
                 warn!("Exit fill received while not in position or closing: {:?}", *state);
@@ -765,20 +1125,36 @@ impl AssetEngine {
         };
 
         if filled_size <= size && filled_size > Decimal::ZERO {
-            // If partial exit, log it
             if filled_size < size {
                 warn!("⚠️ PARTIAL EXIT: size {}, filled {}", size, filled_size);
-                // For simplicity, we still treat as full exit; residual risk remains
             }
 
+            let entry_fee_rate = if USE_LIMIT_ORDERS { *MAKER_FEE } else { *TAKER_FEE };
+            let exit_fee_rate = *TAKER_FEE;
             let gross_pnl = if side == "Buy" {
                 (avg_price - entry_price) * filled_size
             } else {
                 (entry_price - avg_price) * filled_size
             };
-            let entry_fee = entry_price * filled_size * TAKER_FEE;
-            let exit_fee = avg_price * filled_size * TAKER_FEE;
+            let entry_fee = entry_price * filled_size * entry_fee_rate;
+            let exit_fee = avg_price * filled_size * exit_fee_rate;
             let pnl = gross_pnl - entry_fee - exit_fee;
+
+            let win = pnl > Decimal::ZERO;
+            self.analyzer.set_exit_info(win);
+
+            {
+                let mut losses = self.consecutive_losses.lock();
+                if win {
+                    *losses = 0;
+                } else {
+                    *losses += 1;
+                    if *losses >= CONSECUTIVE_LOSS_LIMIT {
+                        warn!("🚨 {} consecutive losses reached – pausing for 60 min", CONSECUTIVE_LOSS_LIMIT);
+                        *self.pause_until.lock() = SystemTime::now() + PAUSE_DURATION;
+                    }
+                }
+            }
 
             {
                 let mut cap = self.capital.lock();
@@ -791,6 +1167,9 @@ impl AssetEngine {
                 info!("📊 Daily PnL: ${:.2}", *daily);
             }
 
+            let mfe = *self.mfe.lock();
+            let mae = *self.mae.lock();
+
             let report = FillReport {
                 symbol: self.symbol.clone(),
                 side: side.clone(),
@@ -799,29 +1178,22 @@ impl AssetEngine {
                 is_exit: true,
                 order_id: order_id.to_string(),
                 pnl,
+                mode: mode.clone(),
+                signal_reason: signal_reason.clone(),
+                imbalance,
+                slope,
+                atr,
+                mfe,
+                mae,
             };
             let json = serde_json::to_string(&report).unwrap();
             let _ = self.pub_tx.send(json);
 
-            info!("📤 Exit: {} PnL=${:.2} (gross=${:.2}, fees=${:.2})",
-                  self.symbol, pnl, gross_pnl, entry_fee + exit_fee);
+            info!("📤 Exit: {} PnL=${:.2} (gross=${:.2}, fees=${:.2}) | Mode: {} | MFE: ${:.2}, MAE: ${:.2}",
+                  self.symbol, pnl, gross_pnl, entry_fee + exit_fee, mode, mfe, mae);
 
             *state = AssetState::Idle;
             info!("🔄 State reset to Idle");
-
-            let orders = {
-                let mut guard = self.active_orders.lock();
-                guard.take()
-            };
-            if let Some((stop_id, limit_id)) = orders {
-                let client = self.client.clone();
-                let symbol = self.symbol.clone();
-                tokio::spawn(async move {
-                    let _ = client.cancel_order(&symbol, &stop_id).await;
-                    let _ = client.cancel_order(&symbol, &limit_id).await;
-                    info!("🧹 Cleaned up leftover bracket orders");
-                });
-            }
         } else {
             warn!("Exit fill size mismatch: expected <= {}, got {}", size, filled_size);
         }
@@ -837,8 +1209,32 @@ impl AssetEngine {
     }
 }
 
+impl Clone for AssetEngine {
+    fn clone(&self) -> Self {
+        Self {
+            symbol: self.symbol.clone(),
+            client: self.client.clone(),
+            pub_tx: self.pub_tx.clone(),
+            state: self.state.clone(),
+            analyzer: self.analyzer.clone(),
+            daily_pnl: self.daily_pnl.clone(),
+            daily_loss_limit_usd: self.daily_loss_limit_usd.clone(),
+            daily_trades: self.daily_trades.clone(),
+            boost_trades_today: self.boost_trades_today.clone(),
+            last_reset_day: self.last_reset_day.clone(),
+            capital: self.capital.clone(),
+            last_price: self.last_price.clone(),
+            consecutive_losses: self.consecutive_losses.clone(),
+            pause_until: self.pause_until.clone(),
+            initial_capital: self.initial_capital,
+            mfe: self.mfe.clone(),
+            mae: self.mae.clone(),
+        }
+    }
+}
+
 // ============================================================
-// ZMQ PUBLISHER THREAD (decoupled)
+// ZMQ, WEBSOCKETS, MAIN
 // ============================================================
 fn start_zmq_publisher(mut rx: tokio::sync::mpsc::UnboundedReceiver<String>) -> Result<()> {
     std::thread::spawn(move || {
@@ -864,9 +1260,6 @@ fn start_zmq_publisher(mut rx: tokio::sync::mpsc::UnboundedReceiver<String>) -> 
     Ok(())
 }
 
-// ============================================================
-// ZMQ REP SERVER – Decoupled Native Thread
-// ============================================================
 fn start_zmq_rep_server(
     assets: Arc<DashMap<String, Arc<AssetEngine>>>,
     handle: tokio::runtime::Handle,
@@ -895,29 +1288,36 @@ fn start_zmq_rep_server(
                 }
             };
             let payload = String::from_utf8_lossy(&msg);
-
-            let resp = match serde_json::from_str::<TradeSignal>(&payload) {
+            match serde_json::from_str::<TradeSignal>(&payload) {
                 Ok(signal) => {
                     if let Some(asset) = assets.get(&signal.symbol) {
-                        handle.block_on(asset.process_signal(signal))
+                        let resp = handle.block_on(asset.process_signal(signal));
+                        let json_resp = serde_json::to_string(&resp).unwrap_or_default();
+                        if let Err(e) = socket.send(json_resp.as_bytes(), 0) {
+                            error!("ZMQ REP send error: {}", e);
+                        }
                     } else {
-                        EngineResponse {
+                        let resp = EngineResponse {
                             status: "ERROR".to_string(),
                             message: "Unknown symbol".to_string(),
                             order_id: None,
+                        };
+                        let json_resp = serde_json::to_string(&resp).unwrap_or_default();
+                        if let Err(e) = socket.send(json_resp.as_bytes(), 0) {
+                            error!("ZMQ REP send error: {}", e);
                         }
                     }
                 }
-                Err(e) => EngineResponse {
-                    status: "ERROR".to_string(),
-                    message: format!("Malformed JSON: {}", e),
-                    order_id: None,
-                },
-            };
-
-            if let Ok(json_resp) = serde_json::to_string(&resp) {
-                if let Err(e) = socket.send(json_resp.as_bytes(), 0) {
-                    error!("ZMQ REP send error: {}", e);
+                Err(e) => {
+                    let resp = EngineResponse {
+                        status: "ERROR".to_string(),
+                        message: format!("Malformed JSON: {}", e),
+                        order_id: None,
+                    };
+                    let json_resp = serde_json::to_string(&resp).unwrap_or_default();
+                    if let Err(e) = socket.send(json_resp.as_bytes(), 0) {
+                        error!("ZMQ REP send error: {}", e);
+                    }
                 }
             }
         }
@@ -925,9 +1325,6 @@ fn start_zmq_rep_server(
     Ok(())
 }
 
-// ============================================================
-// WEBSOCKET: MARKET DATA with reconnect
-// ============================================================
 async fn run_market_websocket(assets: Arc<DashMap<String, Arc<AssetEngine>>>) -> Result<()> {
     let mut backoff = 1;
     loop {
@@ -959,7 +1356,7 @@ async fn run_market_websocket_inner(assets: Arc<DashMap<String, Arc<AssetEngine>
     info!("Connecting to market stream: {}", url);
 
     let (ws_stream, _) = connect_async(url).await?;
-    let (mut write, mut read) = ws_stream.split();
+    let (_write, mut read) = ws_stream.split();
 
     while let Some(msg) = read.next().await {
         if let Ok(Message::Text(text)) = msg {
@@ -1002,6 +1399,7 @@ async fn run_market_websocket_inner(assets: Arc<DashMap<String, Arc<AssetEngine>
                     if let Some(asset) = assets.get(&symbol) {
                         if let (Some(price), Some(qty)) = (data.get("p").and_then(|v| v.as_str()), data.get("q").and_then(|v| v.as_str())) {
                             if let (Ok(p), Ok(q)) = (price.parse::<Decimal>(), qty.parse::<Decimal>()) {
+                                asset.update_last_price(p);
                                 asset.get_analyzer().update_price(p, q);
                             }
                         }
@@ -1013,9 +1411,6 @@ async fn run_market_websocket_inner(assets: Arc<DashMap<String, Arc<AssetEngine>
     Ok(())
 }
 
-// ============================================================
-// WEBSOCKET: USER DATA with integrated keep-alive
-// ============================================================
 async fn run_user_websocket(client: Arc<BinanceClient>, assets: Arc<DashMap<String, Arc<AssetEngine>>>) -> Result<()> {
     let mut backoff = 1;
     loop {
@@ -1023,7 +1418,6 @@ async fn run_user_websocket(client: Arc<BinanceClient>, assets: Arc<DashMap<Stri
             Ok(key) => {
                 let client_clone = client.clone();
                 let key_clone = key.clone();
-                // Spawn keep-alive for this active key
                 let keep_alive_task = tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(Duration::from_secs(1800)).await;
@@ -1064,7 +1458,6 @@ async fn run_user_websocket_inner(listen_key: String, assets: Arc<DashMap<String
                     let status = order.get("X").and_then(|v| v.as_str()).unwrap_or("");
                     let exec_type = order.get("x").and_then(|v| v.as_str()).unwrap_or("");
                     let order_id = order.get("i").and_then(|v| v.as_i64()).unwrap_or(0).to_string();
-                    let side = order.get("S").and_then(|v| v.as_str()).unwrap_or("");
                     let avg_price = order.get("ap").and_then(|v| v.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(Decimal::ZERO);
                     let filled_size = order.get("z").and_then(|v| v.as_str()).and_then(|s| s.parse::<Decimal>().ok()).unwrap_or(Decimal::ZERO);
 
@@ -1094,9 +1487,6 @@ async fn run_user_websocket_inner(listen_key: String, assets: Arc<DashMap<String
     Ok(())
 }
 
-// ============================================================
-// SIGNAL LOOP
-// ============================================================
 async fn run_signal_loop(assets: Arc<DashMap<String, Arc<AssetEngine>>>) {
     let mut interval = time::interval(Duration::from_millis(500));
     loop {
@@ -1104,7 +1494,7 @@ async fn run_signal_loop(assets: Arc<DashMap<String, Arc<AssetEngine>>>) {
         for entry in assets.iter() {
             let asset = entry.value();
             let analyzer = asset.get_analyzer();
-            if let Some((action, price, sl, tp, reason)) = analyzer.analyze() {
+            if let Some((action, price, sl, tp, reason, boost, imbalance, slope, atr)) = analyzer.analyze() {
                 if !asset.is_in_position() && !asset.is_pending() {
                     let signal = TradeSignal {
                         action: action.clone(),
@@ -1114,23 +1504,25 @@ async fn run_signal_loop(assets: Arc<DashMap<String, Arc<AssetEngine>>>) {
                         sl,
                         tp,
                         leverage: 5,
+                        boost,
+                        reason,
+                        imbalance,
+                        slope,
+                        atr,
                     };
                     let _ = asset.process_signal(signal).await;
-                    info!("🎯 DOM Signal: {} | Reason: {} | Price: {}", action, reason, price);
+                    info!("🎯 DOM Signal: {} | Reason: {} | Boost: {} | Price: {}", action, reason, boost, price);
                 }
             }
         }
     }
 }
 
-// ============================================================
-// MAIN
-// ============================================================
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     dotenv().ok();
-    info!("🗡️ KNIFE DOM v8.5.2 — Systems-test ready (Testnet)");
+    info!("🗡️ KNIFE DOM v8.12.1 — Final Production Build (Testnet)");
 
     let initial_capital = Decimal::new(50, 0);
     let daily_loss_pct = std::env::var("DAILY_LOSS_LIMIT")
@@ -1141,7 +1533,6 @@ async fn main() -> Result<()> {
     let daily_loss_limit = Arc::new(Mutex::new(daily_loss_usd));
     info!("💲 Initial capital: ${:.2}, daily loss limit: ${:.2}", initial_capital, daily_loss_usd);
 
-    // ZMQ PUB – decoupled
     let (pub_tx, pub_rx) = tokio::sync::mpsc::unbounded_channel();
     start_zmq_publisher(pub_rx)?;
 
@@ -1157,11 +1548,9 @@ async fn main() -> Result<()> {
     ));
     assets.insert("SOLUSDT".to_string(), asset);
 
-    // ZMQ REP – decoupled native thread
     let handle = tokio::runtime::Handle::current();
     start_zmq_rep_server(assets.clone(), handle)?;
 
-    // Spawn market WebSocket (with reconnect)
     let ws_assets = assets.clone();
     tokio::spawn(async move {
         if let Err(e) = run_market_websocket(ws_assets).await {
@@ -1169,11 +1558,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn signal loop
     let signal_assets = assets.clone();
     tokio::spawn(run_signal_loop(signal_assets));
 
-    // Spawn user WebSocket with integrated keep-alive
     let user_assets = assets.clone();
     let user_client = client.clone();
     tokio::spawn(async move {
