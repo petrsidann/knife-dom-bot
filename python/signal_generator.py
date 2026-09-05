@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""
-KNIFE DOM v8.5.2 — Python Signal Generator
-- Lightweight wrapper for Rust engine
-- Sends manual Close commands
-- Monitors fill reports via ZMQ SUB
-"""
-
-import os
-import sys
-import time
-import json
-import logging
-import threading
+import os, sys, time, json, logging, threading
 from decimal import Decimal, getcontext
 import zmq
 from dotenv import load_dotenv
@@ -77,7 +65,8 @@ sub_socket.connect(ZMQ_SUB_SERVER)
 sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
 sub_socket.setsockopt(zmq.RCVTIMEO, 100)
 
-def send_signal(action, price=0, size=0, sl=0, tp=0, leverage=5):
+def send_signal(action, price=0, size=0, sl=0, tp=0, leverage=5, boost=False,
+                reason="", imbalance=0.0, slope=0.0, atr=0.0):
     payload = {
         "action": action,
         "symbol": SYMBOL,
@@ -86,6 +75,11 @@ def send_signal(action, price=0, size=0, sl=0, tp=0, leverage=5):
         "sl": str(sl),
         "tp": str(tp),
         "leverage": leverage,
+        "boost": boost,
+        "reason": reason,
+        "imbalance": str(imbalance),
+        "slope": str(slope),
+        "atr": str(atr),
     }
     try:
         req_socket.send_string(json.dumps(payload))
@@ -104,6 +98,13 @@ def fill_report_listener():
             symbol = report.get("symbol", "UNKNOWN")
             is_exit = report.get("is_exit", False)
             pnl = Decimal(str(report.get("pnl", 0.0)))
+            mode = report.get("mode", "base")
+            reason = report.get("signal_reason", "")
+            imbalance = Decimal(str(report.get("imbalance", 0.0)))
+            slope = Decimal(str(report.get("slope", 0.0)))
+            atr = Decimal(str(report.get("atr", 0.0)))
+            mfe = Decimal(str(report.get("mfe", 0.0)))
+            mae = Decimal(str(report.get("mae", 0.0)))
 
             if is_exit:
                 capital += pnl
@@ -112,12 +113,12 @@ def fill_report_listener():
                 state["in_position"] = in_position
                 state["daily_pnl"] += float(pnl)
                 save_state(state)
-                logger.info(f"📤 Exit: {symbol} PnL=${pnl:.2f} Capital=${capital:.2f}")
+                logger.info(f"📤 Exit: {symbol} PnL=${pnl:.2f} Capital=${capital:.2f} | Mode: {mode} | Reason: {reason} | Imb: {imbalance:.2f} | Slope: {slope:.5f} | ATR: {atr:.4f} | MFE=${mfe:.4f}, MAE=${mae:.4f}")
             else:
                 in_position = True
                 state["in_position"] = True
                 save_state(state)
-                logger.info(f"📥 Entry: {symbol} filled")
+                logger.info(f"📥 Entry: {symbol} filled | Mode: {mode} | Reason: {reason} | Imb: {imbalance:.2f} | ATR: {atr:.4f}")
 
         except zmq.Again:
             continue
@@ -129,7 +130,7 @@ threading.Thread(target=fill_report_listener, daemon=True).start()
 
 def main():
     global capital, in_position, state
-    logger.info("🗡️ KNIFE DOM v8.5.2 — Systems-test ready (Testnet)")
+    logger.info("🗡️ KNIFE DOM v8.12.1 — Final Production Build (Testnet)")
     logger.info(f"💎 Starting Capital: ${capital:.2f}")
 
     while True:
